@@ -5,7 +5,7 @@ use core::mem;
 
 use aya_bpf::{
     bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT},
-    helpers::{bpf_csum_diff, bpf_redirect_neigh},
+    helpers::{bpf_redirect_neigh},
     macros::{classifier, map},
     maps::HashMap,
     programs::TcContext,
@@ -63,15 +63,6 @@ fn get_backend(key: BackendKey) -> Option<&'static Backend> {
     unsafe { BACKENDS.get(&key) }
 }
 
-fn csum_fold_helper(mut csum: u64) -> u16 {
-    for _i in 0..4 {
-        if (csum >> 16) > 0 {
-            csum = (csum & 0xffff) + (csum >> 16);
-        }
-    }
-    return !(csum as u16);
-}
-
 // Make sure ip_forwarding is enabled on the interface this it attached to
 fn try_tc_ingress(ctx: TcContext) -> Result<i32, i64> {
     let h_proto = u16::from_be(
@@ -102,18 +93,18 @@ fn try_tc_ingress(ctx: TcContext) -> Result<i32, i64> {
         port: (u16::from_be(unsafe { (*udp_hdr).dest })) as u32,
     };
 
-    let backend = get_backend(key).ok_or(TC_ACT_OK)?;
+    let Backend { daddr, dport, ifindex, .. } = get_backend(key).ok_or(TC_ACT_OK)?;
 
     info!(
         &ctx,
         "Received a packet destined for svc ip: {:X} at port: {}",
-        u32::from_be(unsafe { (*ip_hdr).daddr }),
+        u32::from_be(*daddr),
         u16::from_be(unsafe { (*udp_hdr).dest })
     );
 
     // Update destination IP
     unsafe {
-        (*ip_hdr).daddr = backend.daddr.to_be();
+        (*ip_hdr).daddr = daddr.to_be();
     }
 
     if (ctx.data() + ETH_HDR_LEN + size_of::<iphdr>()) > ctx.data_end() {
@@ -121,28 +112,16 @@ fn try_tc_ingress(ctx: TcContext) -> Result<i32, i64> {
         return Ok(TC_ACT_OK);
     }
 
-    // Calculate l3 cksum
-    // TODO(astoycos) use l3_cksum_replace instead
-    unsafe { (*ip_hdr).check = 0 };
-    let full_cksum = unsafe {
-        bpf_csum_diff(
-            mem::MaybeUninit::zeroed().assume_init(),
-            0,
-            ip_hdr as *mut u32,
-            size_of::<iphdr>() as u32,
-            0,
-        )
-    } as u64;
-    unsafe { (*ip_hdr).check = csum_fold_helper(full_cksum) };
+    ctx.l3_csum_replace(ETH_HDR_LEN + offset_of!(iphdr, check), *daddr as u64, daddr.to_be() as u64, 4)?;
 
     // Update destination port
-    unsafe { (*udp_hdr).dest = (backend.dport as u16).to_be() };
+    unsafe { (*udp_hdr).dest = (*dport as u16).to_be() };
     // Kernel allows UDP packet with unset checksums
     unsafe { (*udp_hdr).check = 0 };
 
     let action = unsafe {
         bpf_redirect_neigh(
-            backend.ifindex as u32,
+            *ifindex as u32,
             mem::MaybeUninit::zeroed().assume_init(),
             0,
             0,
